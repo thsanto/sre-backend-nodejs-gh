@@ -1,0 +1,160 @@
+pipeline {
+    agent { node { label 'linux && node10' } }
+
+    environment {
+        DEPLOY_USER     = credentials('deploy_user')
+        DEPLOY_PASS     = credentials('deploy_pass')
+        AZURE_SUBSCRIPTION_ID = credentials('azureSubscriptionId')
+        AZURE_TENANT_ID = credentials('azureTenantId')
+        AZURE_APP_ID = credentials('azureAppId')
+        AZURE_APP_PASS = credentials('azureAppPass')
+        SONAR_TOKEN     = credentials('sonar_token')
+        SONAR_URL       = credentials('sonar_url')
+        NEXUS_BASE_URL = credentials('nexus_base_url')
+        NEXUS_USER = credentials('nexus_user')
+        NEXUS_PASS = credentials('nexus_pass')
+        KUBECONFIG_DEV = credentials('kubeconfig_dev')
+        KUBECONFIG_HML = credentials('kubeconfig_hml')
+        KUBECONFIG_PRD01 = credentials('kubeconfig_prd01')
+        KUBECONFIG_PRD02 = credentials('kubeconfig_prd02')
+        DOCKER_REPOSITORY = credentials('DOCKER_REPOSITORY ')
+        DOCKER_USER_LOGIN = credentials('DOCKER_USER_LOGIN ')
+        DOCKER_USER_PASS = credentials('DOCKER_USER_PASS ')
+        DASA_FORTIFY_TOKEN = credentials('dasa_fortify_token')
+    }
+  
+    options {
+        timeout(time: 1, unit: 'HOURS')
+    }
+
+    stages {
+
+        stage('DevOps-Tools'){
+            steps {
+                sh 'rm -rf check.status'
+                checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'devops-tools']], submoduleCfg: [], userRemoteConfigs: [[url: 'git@bitbucket.org:dasa_desenv_middleware/devops-tools.git']]])
+            }
+        }
+
+        stage('Unit Test') {
+            steps {
+                sh 'devops-tools/pipeline-shared-librares/unit-tests.sh'
+            }
+        }
+
+        stage('Tagging') {
+            steps {
+                sh 'devops-tools/pipeline-shared-librares/tagging.sh'
+            }
+        }
+
+        stage('Parallel Build App') {
+            steps {
+                parallel(
+                    'Build Fortify': {
+                        sh 'devops-tools/pipeline-shared-librares/build-fortify.sh'
+                    },
+                    'Build App': {
+                        sh 'devops-tools/pipeline-shared-librares/build-package.sh'
+                    }
+                )
+            }
+        }
+
+
+        stage('Parallel Quality Analyzing') {
+            steps {
+                parallel(
+                    'Security Analyzing Fortify': {
+                        sh 'devops-tools/pipeline-shared-librares/quality-fortify.sh'
+                    },
+                    'Quality Analyzing': {
+                        withSonarQubeEnv('SonarQube') {
+                            sh 'devops-tools/pipeline-shared-librares/quality.sh -a analize'
+                        }
+                    }
+                )
+            }
+        }        
+
+        stage('Upload Artifact') {
+            steps {
+                sh 'devops-tools/pipeline-shared-librares/nexus-upload.sh'
+            }
+        }
+
+        stage('Deploy Dev') {
+            steps {
+                sh 'devops-tools/pipeline-shared-librares/deploy.sh -a sre-backend-python-dev -r RSG_DEVSECOPS -e dev -i deploy -d cloud'
+                sh 'devops-tools/pipeline-shared-librares/check_upstart_app.sh -u $URL_APP/ -s 200 -t 500 -c 10 -e dev'
+            }
+        }
+        stage('Accept Test Dev'){
+            steps{
+                echo 'devops-tools/pipeline-shared-librares/regression_tests.sh -e dev'
+                echo 'devops-tools/pipeline-shared-librares/slack_publish.sh -m "Testes de Aceite Realizados com Sucesso" -c "testeapi"'
+            }
+        }
+
+        stage('Security Owasp Zap Dev') {
+            steps {
+                script {
+                    echo 'devops-tools/pipeline-shared-librares/security.sh -u $URL_APP/ -o owasp-rollout-dev'
+                }
+            }
+        }
+
+        stage('Quality Gates') {
+            steps {
+                script {
+                    timeout(time: 30, unit: 'MINUTES') {
+                        def qg = waitForQualityGate()
+                            if (qg.status != 'OK') {
+                                error "Pipeline aborted due to quality gates failure: ${qg.status}"
+                            } else {
+                                echo "Quality gates returned ok, with result: ${qg.status}"
+                            }
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Hml') {
+            steps {
+                sh 'devops-tools/pipeline-shared-librares/deploy.sh -a sre-backend-python-hml -r RSG_DEVSECOPS -e hml -i deploy -d cloud'
+                sh 'devops-tools/pipeline-shared-librares/check_upstart_app.sh -u $URL_APP/ -s 200 -t 500 -c 10 -e hml'
+            }
+        }
+
+        stage('Accept Test Hml'){
+            steps{
+                echo 'devops-tools/pipeline-shared-librares/regression_tests.sh -e hml'
+                echo 'devops-tools/pipeline-shared-librares/slack_publish.sh -m "Testes de Aceite Realizados com Sucesso" -c "testeapi"'
+            }
+        }
+
+
+        stage('Security Owasp Zap Hml') {
+            steps {
+                script {
+                    echo 'devops-tools/pipeline-shared-librares/security.sh -u $URL_APP/ -o owasp-rollout-hml'
+                }
+            }
+        }
+
+        stage('Approved to Prod') {
+            steps {
+                script {
+                    sh 'devops-tools/pipeline-shared-librares/approved.sh -e prd'
+                }
+            }
+        }
+
+        stage('Deploy Prd') {
+            steps {
+                sh 'devops-tools/pipeline-shared-librares/deploy.sh -a sre-backend-python-prd -r RSG_DEVSECOPS -e prd -i deploy -d cloud'
+                sh 'devops-tools/pipeline-shared-librares/check_upstart_app.sh -u $URL_APP/ -s 200 -t 500 -c 10 -e prd'
+            }
+        }
+    }
+}
